@@ -3,7 +3,6 @@ package main
 import (
 	"bytes"
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -17,6 +16,7 @@ import (
 	"github.com/rs/zerolog"
 
 	"github.com/chronos-tachyon/github-asset-mirror/indexfile"
+	"github.com/chronos-tachyon/github-asset-mirror/indexutil"
 	"github.com/chronos-tachyon/github-asset-mirror/logging"
 )
 
@@ -111,7 +111,8 @@ func main() {
 		panic(nil)
 	}
 	if err == nil {
-		fromJSON(indexLogger, &releases, raw)
+		ctx2 := indexLogger.WithContext(ctx)
+		indexutil.FromJSON(ctx2, &releases, raw)
 	}
 
 	releaseIndexByTag := make(map[string]uint, 256)
@@ -288,14 +289,8 @@ func main() {
 				panic(nil)
 			}
 
-			_, err = writeFileToDisk(assetPath, raw, asset.Mode())
-			if err != nil {
-				_ = resp.Body.Close()
-				assetLogger.Fatal().
-					Err(err).
-					Msg("failed to write asset to file")
-				panic(nil)
-			}
+			ctx2 := assetLogger.WithContext(ctx)
+			indexutil.WriteFile(ctx2, assetPath, raw, asset.Mode())
 		}
 	}
 
@@ -310,48 +305,13 @@ func main() {
 		}
 	}
 
-	raw = toJSON(indexLogger, releases)
-	_, err = writeFileToDisk(releaseDataPath, raw, 0o666)
+	ctx2 := indexLogger.WithContext(ctx)
+	raw = indexutil.ToJSON(ctx2, releases)
+	indexutil.WriteFile(ctx2, releaseDataPath, raw, 0o666)
 	if err != nil {
 		indexLogger.Fatal().
 			Err(err).
 			Msgf("failed to write contents of new JSON index file")
 		panic(nil)
 	}
-}
-
-func fromJSON[T any](logger zerolog.Logger, ptr *T, raw []byte) {
-	d := json.NewDecoder(bytes.NewReader(raw))
-	d.UseNumber()
-	d.DisallowUnknownFields()
-
-	var tmp T
-	err := d.Decode(&tmp)
-	if err != nil {
-		logger.Fatal().
-			Err(err).
-			Msgf("failed to decode JSON as value of type %T", tmp)
-		panic(nil)
-	}
-
-	*ptr = tmp
-}
-
-func toJSON[T any](logger zerolog.Logger, value T) []byte {
-	var buf bytes.Buffer
-	buf.Grow(1 << 10) // 1 KiB
-
-	e := json.NewEncoder(&buf)
-	e.SetEscapeHTML(false)
-	e.SetIndent("", "  ")
-
-	err := e.Encode(value)
-	if err != nil {
-		logger.Fatal().
-			Err(err).
-			Msgf("failed to encode value of type %T as JSON", value)
-		panic(nil)
-	}
-
-	return buf.Bytes()
 }
