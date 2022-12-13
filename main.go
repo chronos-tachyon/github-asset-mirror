@@ -14,16 +14,22 @@ import (
 
 	"github.com/google/go-github/v48/github"
 	"github.com/pborman/getopt/v2"
+	"github.com/rs/zerolog"
+
+	"github.com/chronos-tachyon/github-asset-mirror/indexfile"
+	"github.com/chronos-tachyon/github-asset-mirror/logging"
 )
 
 var (
 	AppVersion string = "devel"
 )
 
-const UserAgentFormat = "github-asset-mirror/%s (+https://github.com/chronos-tachyon/github-asset-mirror)"
-
-const ReleasesPerPage = 10
-const AssetsPerPage = 10
+const (
+	UserAgentFormat = "github-asset-mirror/%s (+https://github.com/chronos-tachyon/github-asset-mirror)"
+	IndexFileName   = "index.json"
+	ReleasesPerPage = 10
+	AssetsPerPage   = 10
+)
 
 type MyRoundTripper struct {
 	Next  http.RoundTripper
@@ -48,6 +54,11 @@ func (rt *MyRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
 }
 
 func main() {
+	logging.Init()
+
+	ctx := context.Background()
+	logger := zerolog.Ctx(ctx)
+
 	var tokenFile string
 	var ghOwner string
 	var ghRepo string
@@ -60,24 +71,52 @@ func main() {
 	getopt.Parse()
 
 	if tokenFile == "" {
-		panic(fmt.Errorf("missing required flag -T / --token-file"))
+		logger.Fatal().Msg("missing required flag -T / --token-file")
 	}
 	if ghOwner == "" {
-		panic(fmt.Errorf("missing required flag -O / --github-owner"))
+		logger.Fatal().Msg("missing required flag -O / --github-owner")
 	}
 	if ghRepo == "" {
-		panic(fmt.Errorf("missing required flag -R / --github-repo"))
+		logger.Fatal().Msg("missing required flag -R / --github-repo")
 	}
 	if outputDir == "" {
-		panic(fmt.Errorf("missing required flag -d / --output-dir"))
+		logger.Fatal().Msg("missing required flag -d / --output-dir")
 	}
 
 	raw, err := os.ReadFile(tokenFile)
 	if err != nil {
-		panic(fmt.Errorf("failed to read token file: %q: %w", tokenFile, err))
+		logger.Fatal().
+			Str("tokenFile", tokenFile).
+			Err(err).
+			Msg("failed to read GitHub access token from file")
+		panic(nil)
 	}
 	raw = bytes.TrimSpace(raw)
 	accessToken := string(raw)
+
+	releases := make([]indexfile.Release, 0, 256)
+
+	releaseDataPath := filepath.Join(outputDir, IndexFileName)
+	indexLogger := logger.With().
+		Str("path", releaseDataPath).
+		Logger()
+
+	raw, err = os.ReadFile(releaseDataPath)
+	if err != nil && !errors.Is(err, fs.ErrNotExist) {
+		indexLogger.Fatal().
+			Str("path", releaseDataPath).
+			Err(err).
+			Msg("failed to read contents of JSON index file")
+		panic(nil)
+	}
+	if err == nil {
+		fromJSON(indexLogger, &releases, raw)
+	}
+
+	releaseIndexByTag := make(map[string]uint, 256)
+	for index, release := range releases {
+		releaseIndexByTag[release.Tag] = uint(index)
+	}
 
 	var rt http.RoundTripper = http.DefaultClient.Transport
 	if rt == nil {
@@ -85,287 +124,233 @@ func main() {
 	}
 	rt = &MyRoundTripper{Next: rt, Token: accessToken}
 	http.DefaultClient.Transport = rt
-
-	var releaseTags []string
-	var releasesByTag map[string]Release
-
-	releaseDataPath := filepath.Join(outputDir, "data.json")
-	raw, err = os.ReadFile(releaseDataPath)
-	switch {
-	case err == nil:
-		d := json.NewDecoder(bytes.NewReader(raw))
-		d.UseNumber()
-		d.DisallowUnknownFields()
-		err = d.Decode(&releasesByTag)
-		if err != nil {
-			panic(fmt.Errorf("failed to decode contents of JSON data file: %q: %w", releaseDataPath, err))
-		}
-
-	case errors.Is(err, fs.ErrNotExist):
-		releasesByTag = make(map[string]Release, 128)
-
-	default:
-		panic(fmt.Errorf("failed to read JSON data file: %q: %w", releaseDataPath, err))
-	}
-
-	n := uint(len(releasesByTag))
-	n += 64
-	if n < 128 {
-		n = 128
-	}
-	releaseTags = make([]string, 0, n)
-
-	ctx := context.Background()
 	client := github.NewClient(http.DefaultClient)
 
-	err = Iterate(
+	ghLogger := logger.With().
+		Str("githubOwner", ghOwner).
+		Str("githubRepo", ghRepo).
+		Logger()
+
+	Iterate(
 		ReleasesPerPage,
-		func(options *github.ListOptions) (list []*github.RepositoryRelease, resp *github.Response, err error) {
-			list, resp, err = client.Repositories.ListReleases(ctx, ghOwner, ghRepo, options)
-			if err != nil {
-				list = nil
-				resp = nil
-				err = fmt.Errorf("failed to list releases for %s/%s: %w", ghOwner, ghRepo, err)
+		func(options *github.ListOptions) ([]*github.RepositoryRelease, *github.Response) {
+			list, resp, err := client.Repositories.ListReleases(ctx, ghOwner, ghRepo, options)
+			if err == nil {
+				return list, resp
 			}
-			return
+			ghLogger.Fatal().
+				Int("pageNumber", options.Page).
+				Err(err).
+				Msg("failed to list GitHub releases")
+			panic(nil)
 		},
-		func(ghr *github.RepositoryRelease) error {
-			if *ghr.Draft {
-				return nil
+		func(ghr *github.RepositoryRelease) {
+			if ghr.GetDraft() {
+				return
 			}
 
-			id := *ghr.ID
-			tag := *ghr.TagName
-			release, found := releasesByTag[tag]
+			id := ghr.GetID()
+			tag := ghr.GetTagName()
 
-			release.ID = id
-			release.Name = *ghr.Name
-			release.Body = *ghr.Body
+			ghrLogger := ghLogger.With().
+				Int64("releaseID", id).
+				Str("releaseTag", tag).
+				Logger()
 
-			if !found {
+			var release indexfile.Release
+			releaseIndex, found := releaseIndexByTag[tag]
+			switch {
+			case found:
+				release = releases[releaseIndex]
+			default:
 				release.Tag = tag
-				err := release.Version.Parse(tag)
-				if err != nil {
-					return err
+				if !release.Version.Parse(tag) {
+					ghrLogger.Error().
+						Msg("failed to parse GitHub release tag as a semantic version")
+					return
 				}
 			}
 
-			release.Assets = make([]Asset, 2, 16)
-			release.Assets[0] = Asset{
-				URL:  *ghr.TarballURL,
-				Name: "source.tar.gz",
-				Type: SourceTarType,
-				OS:   AnyOS,
-				Arch: AnyArch,
-			}
-			release.Assets[1] = Asset{
-				URL:  *ghr.ZipballURL,
-				Name: "source.zip",
-				Type: SourceZipType,
-				OS:   AnyOS,
-				Arch: AnyArch,
-			}
+			release.ID = id
+			release.Name = ghr.GetName()
+			release.Body = ghr.GetBody()
+			release.Assets = make([]indexfile.Asset, 2, 16)
+			release.Assets[0] = indexfile.MakeSourceTarballAsset(ghr.GetTarballURL())
+			release.Assets[1] = indexfile.MakeSourceZipballAsset(ghr.GetZipballURL())
 
-			err := Iterate(
+			Iterate(
 				AssetsPerPage,
-				func(options *github.ListOptions) (list []*github.ReleaseAsset, resp *github.Response, err error) {
-					list, resp, err = client.Repositories.ListReleaseAssets(ctx, ghOwner, ghRepo, id, options)
-					if err != nil {
-						err = fmt.Errorf("failed to list assets for %s/%s release %d: %w", ghOwner, ghRepo, id, err)
+				func(options *github.ListOptions) ([]*github.ReleaseAsset, *github.Response) {
+					list, resp, err := client.Repositories.ListReleaseAssets(ctx, ghOwner, ghRepo, id, options)
+					if err == nil {
+						return list, resp
 					}
-					return
+					ghrLogger.Fatal().
+						Int("pageNumber", options.Page).
+						Err(err).
+						Msg("failed to list assets for GitHub release")
+					panic(nil)
 				},
-				func(gha *github.ReleaseAsset) error {
-					assetID := gha.GetID()
-					assetURL := gha.GetBrowserDownloadURL()
-					assetName := gha.GetName()
-					release.Assets = append(release.Assets, MakeAsset(assetID, assetURL, assetName))
-					return nil
+				func(gha *github.ReleaseAsset) {
+					release.Assets = append(
+						release.Assets,
+						indexfile.MakeAsset(
+							gha.GetID(),
+							gha.GetBrowserDownloadURL(),
+							gha.GetName(),
+						),
+					)
 				},
 			)
-			if err != nil {
-				return err
-			}
 
-			sortList(release.Assets)
-			releaseTags = append(releaseTags, tag)
-			releasesByTag[tag] = release
-			return nil
+			type AssetList = indexfile.SortableList[indexfile.Asset]
+			AssetList(release.Assets).Sort()
+
+			switch {
+			case found:
+				releases[releaseIndex] = release
+			default:
+				releaseIndex = uint(len(releases))
+				releases = append(releases, release)
+				releaseIndexByTag[tag] = releaseIndex
+			}
 		},
 	)
-	if err != nil {
-		panic(err)
-	}
 
-	for _, tag := range releaseTags {
-		release := releasesByTag[tag]
-		fmt.Printf("%q\n", tag)
+	type ReleaseList = indexfile.SortableList[indexfile.Release]
+	ReleaseList(releases).Sort()
+
+	for _, release := range releases {
 		for _, asset := range release.Assets {
-			assetPath := filepath.Join(outputDir, tag, asset.Name)
+			assetPath := filepath.Join(outputDir, release.Tag, asset.Name)
+
+			assetLogger := logger.With().
+				Int64("releaseID", release.ID).
+				Str("releaseTag", release.Tag).
+				Int64("assetID", asset.ID).
+				Str("assetURL", asset.URL).
+				Str("assetPath", assetPath).
+				Logger()
 
 			_, err := os.Stat(assetPath)
 			if err == nil {
 				continue
 			}
 			if !errors.Is(err, fs.ErrNotExist) {
-				panic(fmt.Errorf("os.Stat: %q: %w", assetPath, err))
+				assetLogger.Fatal().
+					Err(err).
+					Msg("failed to stat file containing downloaded asset")
+				panic(nil)
 			}
 
-			fmt.Printf("\t%q ← %q\n", assetPath, asset.URL)
+			assetLogger.Info().
+				Msg("downloading asset to local file")
 
-			req, err := http.NewRequestWithContext(ctx, http.MethodGet, asset.URL, http.NoBody)
+			reqURL := asset.URL
+			reqMethod := http.MethodGet
+
+			req, err := http.NewRequestWithContext(ctx, reqMethod, reqURL, http.NoBody)
 			if err != nil {
-				panic(err)
+				assetLogger.Fatal().
+					Err(err).
+					Msg("failed to create HTTP request object")
+				panic(nil)
 			}
 
 			resp, err := http.DefaultClient.Do(req)
 			if err != nil {
-				panic(err)
+				assetLogger.Fatal().
+					Err(err).
+					Msg("HTTP request failed")
+				panic(nil)
 			}
+
+			assetLogger = assetLogger.With().
+				Int("statusCode", resp.StatusCode).
+				Logger()
 
 			if resp.StatusCode != http.StatusOK {
 				_ = resp.Body.Close()
-				panic(fmt.Errorf("unexpected HTTP status code %03d", resp.StatusCode))
+				assetLogger.Fatal().
+					Msg("unexpected HTTP status code")
+				panic(nil)
 			}
 
-			_, err = writeFileToDisk(assetPath, resp.Body, asset.Mode())
+			raw, err := io.ReadAll(resp.Body)
 			if err2 := resp.Body.Close(); err == nil {
 				err = err2
 			}
 			if err != nil {
-				panic(err)
+				assetLogger.Fatal().
+					Err(err).
+					Msg("I/O error while reading HTTP response body")
+				panic(nil)
+			}
+
+			_, err = writeFileToDisk(assetPath, raw, asset.Mode())
+			if err != nil {
+				_ = resp.Body.Close()
+				assetLogger.Fatal().
+					Err(err).
+					Msg("failed to write asset to file")
+				panic(nil)
 			}
 		}
 	}
 
-	for _, tag := range releaseTags {
-		release := releasesByTag[tag]
-		releaseDir := filepath.Join(outputDir, tag)
+	for _, release := range releases {
+		releaseDir := filepath.Join(outputDir, release.Tag)
 		for _, asset := range release.Assets {
-			if asset.Type == ExecutableType && release.Version.BuildID == "" {
+			if asset.Type == indexfile.ExecutableType && release.Version.BuildID == "" {
 				if buildID, ok := asset.ExtractBuildID(ctx, releaseDir); ok {
 					release.Version.BuildID = buildID
-					releasesByTag[tag] = release
 				}
 			}
 		}
 	}
 
+	raw = toJSON(indexLogger, releases)
+	_, err = writeFileToDisk(releaseDataPath, raw, 0o666)
+	if err != nil {
+		indexLogger.Fatal().
+			Err(err).
+			Msgf("failed to write contents of new JSON index file")
+		panic(nil)
+	}
+}
+
+func fromJSON[T any](logger zerolog.Logger, ptr *T, raw []byte) {
+	d := json.NewDecoder(bytes.NewReader(raw))
+	d.UseNumber()
+	d.DisallowUnknownFields()
+
+	var tmp T
+	err := d.Decode(&tmp)
+	if err != nil {
+		logger.Fatal().
+			Err(err).
+			Msgf("failed to decode JSON as value of type %T", tmp)
+		panic(nil)
+	}
+
+	*ptr = tmp
+}
+
+func toJSON[T any](logger zerolog.Logger, value T) []byte {
 	var buf bytes.Buffer
+	buf.Grow(1 << 10) // 1 KiB
+
 	e := json.NewEncoder(&buf)
 	e.SetEscapeHTML(false)
 	e.SetIndent("", "  ")
-	err = e.Encode(releasesByTag)
+
+	err := e.Encode(value)
 	if err != nil {
-		panic(fmt.Errorf("failed to encode index data to JSON: %w", err))
-	}
-	raw = buf.Bytes()
-
-	_, err = writeFileToDisk(releaseDataPath, bytes.NewReader(raw), 0o666)
-	if err != nil {
-		panic(fmt.Errorf("failed to write index data to file: %w", err))
-	}
-}
-
-type CallFunc[T any] func(*github.ListOptions) ([]*T, *github.Response, error)
-
-type ProcessFunc[T any] func(*T) error
-
-func Iterate[T any](pageSize int, callFn CallFunc[T], processFn ProcessFunc[T]) error {
-	var options github.ListOptions
-	options.Page = 0
-	options.PerPage = pageSize
-	for {
-		list, resp, err := callFn(&options)
-		if err != nil {
-			return err
-		}
-		for _, item := range list {
-			err = processFn(item)
-			if err != nil {
-				return err
-			}
-		}
-		if resp.NextPage == 0 {
-			break
-		}
-		options.Page = resp.NextPage
-	}
-	return nil
-}
-
-func writeFileToDisk(fileName string, r io.Reader, mode fs.FileMode) (n int64, err error) {
-	fileDir := filepath.Dir(fileName)
-	fileBase := filepath.Base(fileName)
-	fileTemp := filepath.Join(fileDir, ".tmp."+fileBase+"~")
-
-	err = os.MkdirAll(fileDir, 0o777)
-	if err != nil {
-		return n, fmt.Errorf("os.MkdirAll: %q: %w", fileDir, err)
+		logger.Fatal().
+			Err(err).
+			Msgf("failed to encode value of type %T as JSON", value)
+		panic(nil)
 	}
 
-	dir, err := os.OpenFile(fileDir, os.O_RDONLY, 0)
-	if err != nil {
-		return n, fmt.Errorf("os.OpenFile: %q, O_RDONLY: %w", fileDir, err)
-	}
-
-	needDirClose := true
-	defer func() {
-		if needDirClose {
-			_ = dir.Close()
-		}
-	}()
-
-	_ = os.Remove(fileTemp)
-
-	file, err := os.OpenFile(fileTemp, os.O_WRONLY|os.O_CREATE|os.O_EXCL, mode)
-	if err != nil {
-		return n, fmt.Errorf("os.OpenFile: %q, O_WRONLY|O_CREATE|O_EXCL: %w", fileTemp, err)
-	}
-
-	needFileClose := true
-	needFileRemove := true
-	defer func() {
-		if needFileClose {
-			_ = file.Close()
-		}
-		if needFileRemove {
-			_ = os.Remove(fileTemp)
-		}
-	}()
-
-	n, err = io.Copy(file, r)
-	if err != nil {
-		return n, fmt.Errorf("io.Copy: %q: %w", fileTemp, err)
-	}
-
-	err = file.Sync()
-	if err != nil {
-		return n, fmt.Errorf("os.File.Sync: %q: %w", fileTemp, err)
-	}
-
-	needFileClose = false
-	err = file.Close()
-	if err != nil {
-		return n, fmt.Errorf("os.File.Close: %q: %w", fileTemp, err)
-	}
-
-	err = os.Rename(fileTemp, fileName)
-	if err != nil {
-		return n, fmt.Errorf("os.Rename: %q, %q: %w", fileTemp, fileName, err)
-	}
-
-	needFileRemove = false
-	err = dir.Sync()
-	if err != nil {
-		return n, fmt.Errorf("os.File.Sync: %q: %w", fileDir, err)
-	}
-
-	needDirClose = false
-	err = dir.Close()
-	if err != nil {
-		return n, fmt.Errorf("os.File.Close: %q: %w", fileDir, err)
-	}
-
-	return n, nil
+	return buf.Bytes()
 }

@@ -1,4 +1,4 @@
-package main
+package indexfile
 
 import (
 	"bytes"
@@ -7,7 +7,6 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
-	"sort"
 )
 
 var (
@@ -35,6 +34,26 @@ type Asset struct {
 	OS   AssetOS   `json:"os"`
 	Arch AssetArch `json:"arch"`
 	Type AssetType `json:"type"`
+}
+
+func MakeSourceTarballAsset(assetURL string) Asset {
+	return Asset{
+		URL:  assetURL,
+		Name: "source.tar.gz",
+		OS:   AnyOS,
+		Arch: AnyArch,
+		Type: SourceTarType,
+	}
+}
+
+func MakeSourceZipballAsset(assetURL string) Asset {
+	return Asset{
+		URL:  assetURL,
+		Name: "source.zip",
+		OS:   AnyOS,
+		Arch: AnyArch,
+		Type: SourceZipType,
+	}
 }
 
 func MakeAsset(assetID int64, assetURL string, assetName string) Asset {
@@ -70,8 +89,8 @@ func MakeAsset(assetID int64, assetURL string, assetName string) Asset {
 	}
 }
 
-func (asset Asset) Mode() fs.FileMode {
-	switch asset.Type {
+func (a Asset) Mode() fs.FileMode {
+	switch a.Type {
 	case ExecutableType:
 		return 0o777
 	default:
@@ -79,8 +98,8 @@ func (asset Asset) Mode() fs.FileMode {
 	}
 }
 
-func (asset Asset) ExtractBuildID(ctx context.Context, releaseDir string) (string, bool) {
-	assetPath := filepath.Join(releaseDir, asset.Name)
+func (a Asset) ExtractBuildID(ctx context.Context, releaseDir string) (string, bool) {
+	assetPath := filepath.Join(releaseDir, a.Name)
 	cmd := exec.CommandContext(ctx, "go", "version", "-m", assetPath)
 	raw, err := cmd.Output()
 	if err == nil {
@@ -94,78 +113,29 @@ func (asset Asset) ExtractBuildID(ctx context.Context, releaseDir string) (strin
 	return "", false
 }
 
-func (asset Asset) CompareTo(other Asset) CompareResult {
-	return compareReduce(
-		compareByte(asset.OS, other.OS),
-		compareByte(asset.Arch, other.Arch),
-		compareByte(asset.Type, other.Type),
-		compareString(asset.Name, other.Name),
-		compareInt64(asset.ID, other.ID),
-		compareString(asset.URL, other.URL),
-		compareString(asset.Base, other.Base),
-	)
-}
-
-type sortable[T any] interface {
-	CompareTo(T) CompareResult
-}
-
-type sortableList[T sortable[T]] []T
-
-func (list sortableList[T]) Len() int {
-	return len(list)
-}
-
-func (list sortableList[T]) Swap(i, j int) {
-	list[i], list[j] = list[j], list[i]
-}
-
-func (list sortableList[T]) Less(i, j int) bool {
-	return list[i].CompareTo(list[j]) < 0
-}
-
-func sortList[T sortable[T]](list []T) {
-	sort.Sort(sortableList[T](list))
-}
-
-func compareByte[T ~byte](a T, b T) CompareResult {
-	switch {
-	case a == b:
-		return EQ
-	case a < b:
-		return LT
-	default:
-		return GT
+func (a Asset) CompareTo(other Asset) CompareResult {
+	cmp := a.OS.CompareTo(other.OS)
+	if cmp == EQ {
+		cmp = a.Arch.CompareTo(other.Arch)
 	}
+	if cmp == EQ {
+		cmp = a.Type.CompareTo(other.Type)
+	}
+	if cmp == EQ {
+		cmp = CompareString(a.Name, other.Name)
+	}
+	if cmp == EQ {
+		cmp = CompareInt64(a.ID, other.ID)
+	}
+	if cmp == EQ {
+		cmp = CompareString(a.URL, other.URL)
+	}
+	if cmp == EQ {
+		cmp = CompareString(a.Base, other.Base)
+	}
+	return cmp
 }
 
-func compareInt64[T ~int64](a T, b T) CompareResult {
-	switch {
-	case a == b:
-		return EQ
-	case a < b:
-		return LT
-	default:
-		return GT
-	}
-}
-
-func compareString[T ~string](a T, b T) CompareResult {
-	switch {
-	case a == b:
-		return EQ
-	case a < b:
-		return LT
-	default:
-		return GT
-	}
-}
-
-func compareReduce(list ...CompareResult) CompareResult {
-	for _, item := range list {
-		if item != EQ {
-			return item
-		}
-	}
-	return EQ
-}
+var (
+	_ ComparableTo[Asset] = Asset{}
+)
