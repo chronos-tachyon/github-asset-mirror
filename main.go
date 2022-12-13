@@ -55,6 +55,7 @@ func (rt *MyRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
 
 func main() {
 	logging.Init()
+	defer logging.Done()
 
 	ctx := context.Background()
 	logger := zerolog.Ctx(ctx)

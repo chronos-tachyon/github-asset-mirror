@@ -10,6 +10,8 @@ import (
 	"github.com/rs/zerolog/log"
 )
 
+var gLogFile *os.File
+
 func Init() {
 	var logWriter io.Writer
 
@@ -21,15 +23,12 @@ func Init() {
 	case "stdout":
 		logWriter = os.Stdout
 	default:
-		f, err := os.OpenFile(logOutput, os.O_WRONLY|os.O_APPEND|os.O_CREATE, 0o666)
+		var err error
+		gLogFile, err = os.OpenFile(logOutput, os.O_WRONLY|os.O_APPEND|os.O_CREATE, 0o666)
 		if err != nil {
 			panic(fmt.Errorf("failed to open log file: %q: %w", logOutput, err))
 		}
-		defer func() {
-			_ = f.Sync()
-			_ = f.Close()
-		}()
-		logWriter = f
+		logWriter = gLogFile
 	}
 
 	switch logFormat := os.Getenv("LOG_FORMAT"); logFormat {
@@ -82,4 +81,24 @@ func Init() {
 	zerolog.DurationFieldUnit = time.Second
 	zerolog.DurationFieldInteger = false
 	zerolog.DefaultContextLogger = &log.Logger
+}
+
+func Done() {
+	f := gLogFile
+	gLogFile = nil
+
+	if f == nil {
+		return
+	}
+
+	err := f.Sync()
+	if err != nil {
+		_ = f.Close()
+		panic(fmt.Errorf("failed to sync log file: %w", err))
+	}
+
+	err = f.Close()
+	if err != nil {
+		panic(fmt.Errorf("failed to close log file: %w", err))
+	}
 }
