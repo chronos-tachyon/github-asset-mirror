@@ -20,6 +20,25 @@ func (r Release) CompareTo(other Release) CompareResult {
 	return cmp
 }
 
+func (r Release) FirstMatchingAsset(fn func(Asset) bool) (Asset, bool) {
+	for _, a := range r.Assets {
+		if fn(a) {
+			return a, true
+		}
+	}
+	return Asset{}, false
+}
+
+func (r Release) MatchingAssets(fn func(Asset) bool) []Asset {
+	out := make([]Asset, 0, len(r.Assets))
+	for _, a := range r.Assets {
+		if fn(a) {
+			out = append(out, a)
+		}
+	}
+	return out
+}
+
 var (
 	_ ComparableTo[Release] = Release{}
 )
