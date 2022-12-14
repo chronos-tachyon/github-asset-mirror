@@ -26,7 +26,6 @@ var (
 
 const (
 	UserAgentFormat = "github-asset-mirror/%s (+https://github.com/chronos-tachyon/github-asset-mirror)"
-	IndexFileName   = "index.json"
 	ReleasesPerPage = 10
 	AssetsPerPage   = 10
 )
@@ -97,15 +96,14 @@ func main() {
 
 	releases := make([]indexfile.Release, 0, 256)
 
-	releaseDataPath := filepath.Join(outputDir, IndexFileName)
+	indexFilePath := filepath.Join(outputDir, indexfile.IndexFileName)
 	indexLogger := logger.With().
-		Str("path", releaseDataPath).
+		Str("path", indexFilePath).
 		Logger()
 
-	raw, err = os.ReadFile(releaseDataPath)
+	raw, err = os.ReadFile(indexFilePath)
 	if err != nil && !errors.Is(err, fs.ErrNotExist) {
 		indexLogger.Fatal().
-			Str("path", releaseDataPath).
 			Err(err).
 			Msg("failed to read contents of JSON index file")
 		panic(nil)
@@ -307,7 +305,7 @@ func main() {
 
 	ctx2 := indexLogger.WithContext(ctx)
 	raw = indexutil.ToJSON(ctx2, releases)
-	indexutil.WriteFile(ctx2, releaseDataPath, raw, 0o666)
+	indexutil.WriteFile(ctx2, indexFilePath, raw, 0o666)
 	if err != nil {
 		indexLogger.Fatal().
 			Err(err).
