@@ -6,6 +6,7 @@ require (
 	github.com/google/go-github/v48 v48.2.0
 	github.com/pborman/getopt/v2 v2.1.0
 	github.com/rs/zerolog v1.28.0
+	gopkg.in/yaml.v3 v3.0.1
 )
 
 require (
